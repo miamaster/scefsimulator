@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -61,11 +62,19 @@ type Subscriber struct {
 	MaximumReport           uint32           `json:"maximumNumberOfReports,string,omitempty"`
 }
 
+// UpdateRequest describe inputs for an update request
+type UpdateRequest struct {
+	CellID string `json:"cellID"`
+}
+
 // SubscriptionStore represents a map that store subscribers
 type SubscriptionStore struct {
-	mapStore map[string]Subscriber
+	mapStore map[string]*Subscriber
 	lock     sync.RWMutex
 }
+
+// NumberOfCellIDs is the number of cells used in simulation
+const NumberOfCellIDs = 10
 
 func getCellID(number int) string {
 	return []string{
@@ -80,6 +89,42 @@ func getCellID(number int) string {
 		"311-480-770308",
 		"311-480-770309",
 	}[number]
+}
+
+// PostToCAAS handles POST request to CAAS
+func PostToCAAS(subscriber Subscriber, wait int) {
+	monitoringEvent := MonitoringEvent{
+		Subscription: subscriber.Self,
+		MonitoringEventReport: []LocationReport{
+			{
+				MSISDN:         subscriber.MSISDN,
+				MonitoringType: subscriber.MonitoringType,
+				LocationInfo: Location{
+					Age:    0,
+					CellID: subscriber.CellID,
+				},
+			},
+		},
+	}
+	reqbody, err := json.Marshal(monitoringEvent)
+	if err != nil {
+		log.Println("PostToCAAS: cannot send POST request, something wrong with encoding")
+		return
+	}
+	time.Sleep(time.Duration(wait) * time.Second)
+	log.Printf("PostToCAAS: waiting %d seconds to send notification to %s", wait, subscriber.NotificationDestination)
+	log.Printf("PostToCAAS: json %s\n", string(reqbody))
+	resp, err := http.Post(subscriber.NotificationDestination, "application/json", bytes.NewBuffer(reqbody))
+	if err != nil {
+		log.Println("PostToCAAS: POST request failed")
+		return
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Println("PostToCAAS: Something bad happen with reading POST body")
+	}
+	log.Printf("PostToCAAS: POST response: %d, %s\n", resp.StatusCode, (body))
 }
 
 // AddSubscriber handles POST requests for subscriptions
@@ -132,13 +177,13 @@ func (ss *SubscriptionStore) AddSubscriber(w http.ResponseWriter, req *http.Requ
 	}
 
 	// adding subscriber now
-	randCellNumber := rand.Intn(10)
+	randCellNumber := rand.Intn(NumberOfCellIDs)
 	subID := uuid.New().String()
 	subscriber.Self = SelfBase + subID
 	subscriber.CellID = getCellID(randCellNumber)
 	log.Printf("AddSubscriber: %+v\n", subscriber)
 	ss.lock.Lock()
-	ss.mapStore[subID] = subscriber
+	ss.mapStore[subID] = &subscriber
 	ss.lock.Unlock()
 
 	// write back response 201
@@ -147,41 +192,8 @@ func (ss *SubscriptionStore) AddSubscriber(w http.ResponseWriter, req *http.Requ
 	json.NewEncoder(w).Encode(subscriber)
 
 	// setup new struct for response
-	go func() {
-		monitoringEvent := MonitoringEvent{
-			Subscription: subscriber.Self,
-			MonitoringEventReport: []LocationReport{
-				{
-					MSISDN:         subscriber.MSISDN,
-					MonitoringType: subscriber.MonitoringType,
-					LocationInfo: Location{
-						Age:    0,
-						CellID: subscriber.CellID,
-					},
-				},
-			},
-		}
-		reqbody, err := json.Marshal(monitoringEvent)
-		if err != nil {
-			log.Println("AddSubscriber: cannot send POST request, something wrong with encoding")
-			return
-		}
-		wait := rand.Intn(6)
-		time.Sleep(time.Duration(wait) * time.Second)
-		log.Printf("AddSubscriber: waiting %d seconds to send notification to %s", wait, subscriber.NotificationDestination)
-		log.Printf("AddSubscriber: json %s\n", string(reqbody))
-		resp, err := http.Post(subscriber.NotificationDestination, "application/json", bytes.NewBuffer(reqbody))
-		if err != nil {
-			log.Println("AddSubscriber: POST request failed")
-			return
-		}
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			log.Println("AddSubscriber: Something bad happen with reading POST body")
-		}
-		log.Printf("AddSubscriber: POST response %s\n", string(body))
-	}()
+	wait := rand.Intn(3)
+	go PostToCAAS(subscriber, wait)
 }
 
 // ListSubscriber handles GET requests for subscriptions
@@ -206,7 +218,7 @@ func (ss *SubscriptionStore) ListSubscriber(w http.ResponseWriter, req *http.Req
 	}
 
 	// get a subscriber for the subscription store
-	var subscriber Subscriber
+	var subscriber *Subscriber
 	ss.lock.RLock()
 	subscriber, found = ss.mapStore[subID]
 	ss.lock.RUnlock()
@@ -249,6 +261,51 @@ func (ss *SubscriptionStore) RemoveSubscriber(w http.ResponseWriter, req *http.R
 	}
 }
 
+// UpdateSubscriber updates the subscriber
+func (ss *SubscriptionStore) UpdateSubscriber(w http.ResponseWriter, req *http.Request) {
+	log.Println("UpdateSubscriber: updating subscriber...")
+	pathVars := mux.Vars(req)
+	var subID string
+	var found bool
+
+	// do simple error checking
+	if subID, found = pathVars["subID"]; !found {
+		log.Printf("UpdateSubscriber: subscriber ID not found on SCEF...\n")
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	// get a subscriber for the subscription store and delete it
+	ss.lock.RLock()
+	_, found = ss.mapStore[subID]
+	ss.lock.RUnlock()
+	if found {
+		// decode subscriber from request body
+		updateReq := UpdateRequest{}
+		err := json.NewDecoder(req.Body).Decode(&updateReq)
+		if err != nil {
+			log.Printf("UpdateSubscriber: error occured while decode, %s", err)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		lastChar := string(updateReq.CellID[len(updateReq.CellID)-1])
+		idx, err := strconv.ParseInt(lastChar, 10, 32)
+		if err != nil || getCellID(int(idx)) != updateReq.CellID {
+			log.Printf("UpdateSubscriber: cell id input is not correct, %s", err)
+			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+			return
+		}
+		ss.lock.Lock()
+		ss.mapStore[subID].CellID = getCellID(int(idx))
+		ss.lock.Unlock()
+		PostToCAAS(*ss.mapStore[subID], 0)
+		w.WriteHeader(http.StatusOK)
+	} else {
+		log.Printf("ListSubscriber: subscriber ID not found on SCEF...\n")
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+	}
+}
+
 // SCEFStore represents individual SCEF accounts, each with a susbsciprtion mapping
 type SCEFStore map[string]*SubscriptionStore
 
@@ -278,6 +335,8 @@ func (s SCEFStore) SCEFHandler(w http.ResponseWriter, r *http.Request) {
 		SCEFInstance.ListSubscriber(w, r)
 	case "DELETE":
 		SCEFInstance.RemoveSubscriber(w, r)
+	case "PUT":
+		SCEFInstance.UpdateSubscriber(w, r)
 	default:
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 	}
@@ -311,7 +370,7 @@ func ExpirationWatcher(SCEF SCEFStore) {
 func main() {
 	// create a simple subscription storage
 	subStore := &SubscriptionStore{
-		mapStore: map[string]Subscriber{},
+		mapStore: map[string]*Subscriber{},
 		lock:     sync.RWMutex{},
 	}
 	// TODO: make this configurable and perhaps dynamic in the future
@@ -326,5 +385,8 @@ func main() {
 	r.HandleFunc("/{SCEFUser}/subscriptions", SCEF.SCEFHandler).Methods("GET")
 	r.HandleFunc("/{SCEFUser}/subscriptions/{subID}", SCEF.SCEFHandler).Methods("GET")
 	r.HandleFunc("/{SCEFUser}/subscriptions/{subID}", SCEF.SCEFHandler).Methods("DELETE")
+	r.HandleFunc("/{SCEFUser}/subscriptions/{subID}", SCEF.SCEFHandler).Methods("PUT")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8000", r))
 }
+
+//TODO: create handover action using MSISDN '19009001111'
